@@ -4,7 +4,8 @@
 --     psql -v ON_ERROR_STOP=1 -f 026_agent_async_tool_task_down.sql
 -- 必须带 ON_ERROR_STOP=1：不带它时，某条语句出错后 psql 不会停下来，退出码仍然是 0；
 -- 而事务里出过错以后 COMMIT 会被当成回滚执行，不看输出会误以为回写成功。
--- 执行完确认前三条核对查询都是空结果、第四条信息查询没有需要人工处理的行，再部署上一个版本。
+-- 执行完确认前三条核对查询都是空结果、第四条信息查询没有需要人工处理的行、第五条
+-- 查到子运行意图外键且 convalidated = false，再部署上一个版本。
 -- 本脚本不在 migrate.py 的自动迁移序列里，必须由操作者显式执行；
 -- 执行前先确认新表之外没有别的写入方。
 --
@@ -19,6 +20,10 @@
 -- sub_agent_wait_v1），只有拆到独立列的沙箱任务编号与名额凭证再补回去，
 -- 结构版本在快照里缺失时才用列值补。升级时折叠成取消的迟到结果恢复成取消终态，
 -- 旧版本不再按迟到分支处理它。
+--
+-- 回退第 4 步补回子运行意图指向旧等待成员表的外键，但带 NOT VALID：本脚本只把未完结任务
+-- 写回旧表，升级窗口内新代码产生、后来已到终态的成员不会回写，直接校验历史行会失败。
+-- NOT VALID 只校验回退之后的新写入，而旧版本的新写入只引用旧表成员，正好符合。
 --
 -- 凑不齐回写键（组、成员序号、成员身份）的未完结任务写不进旧表：把它的原因码与名额凭证记录
 -- 留在新表里（ROLLBACK_INCOMPLETE），末尾第四条查询会把它们列出来，由操作者按凭证核对容量账本，
@@ -135,9 +140,21 @@ WHERE t.state = 'CANCELED'
   AND (t.stop_state <> 'CONFIRMED' OR t.task_id IS NOT NULL)
 ON CONFLICT DO NOTHING;
 
+-- 4. 补回子运行意图指向旧等待成员表的外键（升级脚本删掉了它）。
+--    升级窗口内新产生的终态成员不回写旧表，直接校验历史行会失败，所以带 NOT VALID：
+--    之后的新写入仍会被校验，已有行不回头检查。旧版本插入子运行意图前会先写旧等待成员，
+--    同一条事务里外键条件成立。
+ALTER TABLE IF EXISTS alphafrog_agent_run_child_intent
+    DROP CONSTRAINT IF EXISTS agent_run_child_intent_member_fk;
+ALTER TABLE IF EXISTS alphafrog_agent_run_child_intent
+    ADD CONSTRAINT agent_run_child_intent_member_fk
+    FOREIGN KEY (parent_wait_group_id, parent_member_identity)
+    REFERENCES alphafrog_agent_run_wait_member(group_id, member_identity)
+    DEFERRABLE INITIALLY DEFERRED NOT VALID;
+
 COMMIT;
 
--- 4. 回退后核对：前三查询必须返回 0 行，有结果时不要部署上一版本；
+-- 5. 回退后核对：前三查询必须返回 0 行，有结果时不要部署上一版本；
 --    第四条是信息查询，正常情况下会有 0 行，出现行时按凭证人工核对，不属于「必须为空」。
 --    第一条：新表里还有待执行或执行中的任务没写回旧表（正常应为 0；第 2 步已经把
 --    写不回的未完结行改成失败，它们不会出现在这里）。
@@ -180,3 +197,10 @@ SELECT t.job_id, t.run_id, t.tool_name, t.stop_state,
        t.reservation_json
   FROM alphafrog_agent_async_tool_task t
  WHERE t.result_ref_json ->> 'exit_reason' = 'ROLLBACK_INCOMPLETE';
+
+--    第五条（信息查询，不属于「必须为空」）：子运行意图外键应存在且未做历史行校验。
+--    期望恰好 1 行、convalidated = false；查不到说明第 4 步没生效。
+SELECT c.conname, c.convalidated
+  FROM pg_constraint c
+ WHERE c.conname = 'agent_run_child_intent_member_fk'
+   AND c.connamespace = current_schema()::regnamespace;

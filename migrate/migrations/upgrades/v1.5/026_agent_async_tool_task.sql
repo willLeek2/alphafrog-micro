@@ -90,6 +90,15 @@ CREATE INDEX IF NOT EXISTS idx_agent_async_tool_task_stop_due
     ON alphafrog_agent_async_tool_task(next_poll_at, job_id)
     WHERE stop_state IN ('PENDING', 'CLAIMED');
 
+-- 子运行意图原来用 (等待组, 成员身份) 外键指向旧等待成员表，然后延迟到事务提交才检查。
+-- 第一步之后产品只往新表写等待成员，这条外键会让每一条新建的子运行意图在提交时被拒绝；
+-- 旧表在第七步删除，这条外键本来也留不到那时。删掉它，成员引用的完整性改由两条查新表的
+-- 语句保证：插入前 matchesParentWaitMember（组、Run、成员身份、工具调用与工具名），
+-- 以及 parentWaitMemberStillOpen 判断父成员是否仍未完结。
+-- 这里不加 IF EXISTS：这条外键由 018 脚本必然建立，缺失说明目标库不对，应当报错而不是跳过。
+ALTER TABLE alphafrog_agent_run_child_intent
+    DROP CONSTRAINT agent_run_child_intent_member_fk;
+
 -- 一次性迁移：只迁未完结的异步任务，以及仍有未确认停机的已取消任务。
 -- 已终态且没有停机尾巴的行留在旧表，随第七步删表一起清理。
 --

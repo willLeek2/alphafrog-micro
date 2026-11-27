@@ -69,6 +69,34 @@ class AsyncToolTaskMigrationSqlTest {
     }
 
     @Test
+    void upgradeRetiresTheChildIntentForeignKeyToTheOldMemberTable() {
+        assertThat(UPGRADE).as("第一步之后新成员只写新表，指向旧表的外键会让新建子运行意图在提交时被拒")
+                .contains("DROP CONSTRAINT agent_run_child_intent_member_fk;")
+                .doesNotContain("DROP CONSTRAINT IF EXISTS agent_run_child_intent_member_fk");
+        assertThat(UPGRADE).as("这条外键由 018 必然建立，缺失说明目标库不对，不能跳过")
+                .contains("ALTER TABLE alphafrog_agent_run_child_intent");
+        assertThat(occurrences(UPGRADE, "REFERENCES alphafrog_agent_run_wait_member"))
+                .as("升级脚本不再引用旧等待成员表作为外键目标").isZero();
+        assertThat(DOWNGRADE).as("回退时补回旧外键；升级窗口内的终态成员没有回写，不能回头校验历史行")
+                .contains("ADD CONSTRAINT agent_run_child_intent_member_fk")
+                .contains("NOT VALID");
+        assertThat(occurrences(DOWNGRADE, "REFERENCES alphafrog_agent_run_wait_member"))
+                .as("回退脚本里只有补回子运行意图外键这一处引用旧等待成员表").isEqualTo(1);
+        assertThat(DOWNGRADE).as("回退后的核对查询要确认外键存在且未做历史行校验")
+                .contains("convalidated");
+    }
+
+    private static int occurrences(String text, String needle) {
+        int count = 0;
+        int from = 0;
+        while ((from = text.indexOf(needle, from)) >= 0) {
+            count++;
+            from += needle.length();
+        }
+        return count;
+    }
+
+    @Test
     void rollbackIsAtomicAndMarksWhatItCannotWriteBack() {
         assertThat(DOWNGRADE).as("手工执行的脚本也要整份一个事务")
                 .contains("BEGIN;")
