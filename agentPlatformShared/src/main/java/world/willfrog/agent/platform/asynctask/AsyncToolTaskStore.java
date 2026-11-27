@@ -45,8 +45,10 @@ public interface AsyncToolTaskStore {
     /** 取消一笔运行：把该运行所有未完结任务标成已取消并留下待停止意图；时间取数据库时钟。 */
     int requestStopByRun(String runId);
 
-    /** 扫描待停止或停机重试到期的任务。 */
-    List<AsyncToolTask> scanStopDue(OffsetDateTime now, long afterJobId, int limit);
+    /** 扫描本部署代际、本泳道的待停止或停机重试到期任务；泳道为空表示主泳道。 */
+    List<AsyncToolTask> scanStopDue(String deploymentId, String deploymentGenerationId,
+                                    String laneTag, OffsetDateTime now,
+                                    long afterJobId, int limit);
 
     /** 抢占停机动作；返回空表示别的实例已持有。 */
     Optional<AsyncToolTask> claimStop(long jobId, String owner, OffsetDateTime now,

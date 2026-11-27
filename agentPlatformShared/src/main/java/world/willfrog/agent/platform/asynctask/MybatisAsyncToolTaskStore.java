@@ -149,11 +149,16 @@ public class MybatisAsyncToolTaskStore implements AsyncToolTaskStore {
     }
 
     @Override
-    public List<AsyncToolTask> scanStopDue(OffsetDateTime now, long afterJobId, int limit) {
+    public List<AsyncToolTask> scanStopDue(String deploymentId, String deploymentGenerationId,
+                                           String laneTag, OffsetDateTime now,
+                                           long afterJobId, int limit) {
+        required(deploymentId, "部署标识");
+        required(deploymentGenerationId, "部署代际");
         if (now == null || afterJobId < 0 || limit < 1 || limit > 1000) {
             throw new IllegalArgumentException("停机扫描参数无效");
         }
-        return mapper.scanStopDue(now, afterJobId, limit);
+        return mapper.scanStopDue(deploymentId, deploymentGenerationId, laneTag,
+                now, afterJobId, limit);
     }
 
     @Override

@@ -7,6 +7,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.test.util.ReflectionTestUtils;
 import world.willfrog.agent.platform.asynctask.AsyncToolTask;
 import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
@@ -20,6 +21,7 @@ import world.willfrog.agent.tools.sandboxjob.SandboxJobObservability;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.common.lane.LaneContext;
@@ -71,7 +73,8 @@ class CanceledSqlWaitMemberStopWorkerTest {
         AgentRun run = new AgentRun(); run.setId(RUN); run.setStatus(AgentRunStatus.CANCELED); run.setLaneTag("sql-stop-lane");
         when(ownership.findOwnedRun(RUN)).thenReturn(run);
         worker = new CanceledWaitMemberStopWorker(tasks, groups, sandbox, settlement, json,
-                ownership, mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5, 30);
+                ownership, mock(DualPoolRunAdmissionRegistry.class),
+                new DualPoolSchedulerSettings(null, new MockEnvironment()), 2, 120, 5, 30);
         member = new WaitMember(); member.setId(JOB_ID); member.setGroupId(7L); member.setRunId(RUN);
         member.setMemberIdentity("query-member"); member.setToolCallId("raw-model-call");
         member.setToolName("executeQuery"); member.setExternalOperationId(operation.operationId()); member.setState("CANCELED");
@@ -121,7 +124,8 @@ class CanceledSqlWaitMemberStopWorkerTest {
     }
 
     private void claimAgain() {
-        when(tasks.scanStopDue(any(), anyLong(), anyInt())).thenReturn(List.of(task), List.of());
+        when(tasks.scanStopDue(any(), any(), any(), any(), anyLong(), anyInt()))
+                .thenReturn(List.of(task), List.of());
         when(tasks.claimStop(anyLong(), anyString(), any(), any()))
                 .thenReturn(Optional.of(task), Optional.empty());
     }

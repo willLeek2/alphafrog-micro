@@ -418,6 +418,8 @@ class Stage3WaitContractPostgresTest {
     @Test
     void canceledExternalMemberCreatesDurableStopTaskAndRequiresTerminalEvidence() throws Exception {
         String runId = "run-external-stop";
+        String deploymentId = "stable";
+        String deploymentGenerationId = "gen-" + "a".repeat(64);
         createRun(runId, 0, 0L);
         createSegment(runId, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
         WaitGroupStore groups = new MybatisWaitGroupStore(
@@ -461,7 +463,8 @@ class Stage3WaitContractPostgresTest {
             assertThat(groups.listOpenGroupsByRun(runId, 0, 10)).isEmpty();
 
             // 入队时就到期：停机扫描必须立刻看得见它，不能等任务行原来的轮询退避。
-            assertThat(tasks.scanStopDue(OffsetDateTime.now(), 0, 1000))
+            assertThat(tasks.scanStopDue(deploymentId, deploymentGenerationId, null,
+                    OffsetDateTime.now(), 0, 1000))
                     .extracting(AsyncToolTask::getJobId).contains(memberId);
 
             AsyncToolTask claimed = transaction.execute(ignored -> tasks.claimStop(
@@ -483,9 +486,11 @@ class Stage3WaitContractPostgresTest {
             assertThat(retried.getStopLastError()).isEqualTo("terminal unavailable");
             // 重试把租约还回去，但在下一次尝试时刻之前不会被停机扫描取走。
             OffsetDateTime retryAt = OffsetDateTime.now().plusMinutes(3);
-            assertThat(tasks.scanStopDue(OffsetDateTime.now(), 0, 1000))
+            assertThat(tasks.scanStopDue(deploymentId, deploymentGenerationId, null,
+                    OffsetDateTime.now(), 0, 1000))
                     .extracting(AsyncToolTask::getJobId).doesNotContain(memberId);
-            assertThat(tasks.scanStopDue(retryAt, 0, 1000))
+            assertThat(tasks.scanStopDue(deploymentId, deploymentGenerationId, null,
+                    retryAt, 0, 1000))
                     .extracting(AsyncToolTask::getJobId).contains(memberId);
             // 到了重试时刻，别的实例可以接手，领取轮次随之前进一格。
             AsyncToolTask reclaimed = transaction.execute(ignored -> tasks.claimStop(
@@ -501,6 +506,65 @@ class Stage3WaitContractPostgresTest {
             assertThat(confirmed.getStopLastError()).isNull();
             assertThat(confirmed.getTaskId()).isEqualTo("task-1");
         }
+    }
+
+    @Test
+    void stopScanSkipsTasksOfAnotherDeploymentGenerationOrLane() throws Exception {
+        String ownedRun = "run-stop-scope-owned";
+        String otherDeploymentRun = "run-stop-scope-other-deployment";
+        String otherGenerationRun = "run-stop-scope-other-generation";
+        String otherLaneRun = "run-stop-scope-other-lane";
+        createRun(ownedRun, 0, 0L);
+        createSegment(ownedRun, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        createRun(otherDeploymentRun, 0, 0L);
+        execute("UPDATE alphafrog_agent_run SET deployment_id = 'beta' "
+                + "WHERE id = '" + otherDeploymentRun + "'");
+        createSegment(otherDeploymentRun, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        createRun(otherGenerationRun, 0, 0L);
+        execute("UPDATE alphafrog_agent_run SET deployment_generation_id = 'gen-" + "b".repeat(64) + "' "
+                + "WHERE id = '" + otherGenerationRun + "'");
+        createSegment(otherGenerationRun, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        createRun(otherLaneRun, 0, 0L);
+        execute("UPDATE alphafrog_agent_run SET lane_tag = 'lane-other' "
+                + "WHERE id = '" + otherLaneRun + "'");
+        createSegment(otherLaneRun, 0, "node-1", 0, 0, 3, "worker-1", 2L, 0L, "EXECUTING");
+        WaitGroupStore groups = new MybatisWaitGroupStore(
+                new SqlSessionTemplate(sqlSessionFactory).getMapper(WaitGroupMapper.class));
+        long ownedTask = queueStopForScanScope(groups, ownedRun, "run-stop-scope-owned:call:1");
+        long otherDeploymentTask = queueStopForScanScope(groups, otherDeploymentRun,
+                "run-stop-scope-other-deployment:call:1");
+        long otherGenerationTask = queueStopForScanScope(groups, otherGenerationRun,
+                "run-stop-scope-other-generation:call:1");
+        long otherLaneTask = queueStopForScanScope(groups, otherLaneRun,
+                "run-stop-scope-other-lane:call:1");
+        try (AnnotationConfigApplicationContext context = stopStoreContext()) {
+            AsyncToolTaskStore tasks = context.getBean(AsyncToolTaskStore.class);
+            OffsetDateTime now = OffsetDateTime.now();
+            // 本部署、本代际、主泳道：只看得到自己的待停任务。
+            assertThat(tasks.scanStopDue("stable", "gen-" + "a".repeat(64), null, now, 0, 1000))
+                    .extracting(AsyncToolTask::getJobId)
+                    .contains(ownedTask)
+                    .doesNotContain(otherDeploymentTask, otherGenerationTask, otherLaneTask);
+            // 三个反面条件各自换成对应的归属身份后都能扫到，证明任务确实已入队、只是被范围挡住。
+            assertThat(tasks.scanStopDue("beta", "gen-" + "a".repeat(64), null, now, 0, 1000))
+                    .extracting(AsyncToolTask::getJobId).contains(otherDeploymentTask);
+            assertThat(tasks.scanStopDue("stable", "gen-" + "b".repeat(64), null, now, 0, 1000))
+                    .extracting(AsyncToolTask::getJobId).contains(otherGenerationTask);
+            assertThat(tasks.scanStopDue("stable", "gen-" + "a".repeat(64), "lane-other", now, 0, 1000))
+                    .extracting(AsyncToolTask::getJobId).contains(otherLaneTask);
+        }
+    }
+
+    /** 造一条已派发、随后取消的等待组，返回任务行编号（停机扫描要看的行）。 */
+    private static long queueStopForScanScope(WaitGroupStore groups, String runId, String operationId) {
+        long groupId = suspendExternalGroup(runId);
+        String proof = "{\"operationId\":\"" + operationId + "\",\"taskId\":\"task-scope\","
+                + "\"requestFingerprint\":\"sha256:" + "a".repeat(64) + "\"}";
+        assertThat(groups.markMemberDispatched(groupId, "call-a", operationId, proof,
+                OffsetDateTime.now(), 0L)).isTrue();
+        long memberId = groups.listMembers(groupId).get(0).getId();
+        assertThat(groups.cancelChain(groupId).canceled()).isTrue();
+        return memberId;
     }
 
     @Test

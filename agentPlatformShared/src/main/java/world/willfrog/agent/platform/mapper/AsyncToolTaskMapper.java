@@ -73,8 +73,11 @@ public interface AsyncToolTaskMapper {
     /** 取消一笔运行时，把该运行所有未完结任务标成待停止；同一事务内调用。时间取数据库时钟。 */
     int requestStopByRun(@Param("runId") String runId);
 
-    /** 扫描待停止或停机重试到期的任务。 */
-    List<AsyncToolTask> scanStopDue(@Param("now") OffsetDateTime now,
+    /** 扫描本部署代际、本泳道的待停止或停机重试到期任务。 */
+    List<AsyncToolTask> scanStopDue(@Param("deploymentId") String deploymentId,
+                                    @Param("deploymentGenerationId") String deploymentGenerationId,
+                                    @Param("laneTag") String laneTag,
+                                    @Param("now") OffsetDateTime now,
                                     @Param("afterJobId") long afterJobId,
                                     @Param("limit") int limit);
 

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.mock.env.MockEnvironment;
 import world.willfrog.agent.platform.asynctask.AsyncToolTask;
 import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
 import world.willfrog.agent.platform.wait.WaitGroupStore;
@@ -11,6 +12,7 @@ import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.entity.AgentRun;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
 import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
@@ -69,7 +71,8 @@ class CanceledWaitMemberStopWorkerTest {
         when(ownership.findOwnedRun("run-1")).thenReturn(run);
         worker = new CanceledWaitMemberStopWorker(tasks, groups, sandbox,
                 settlement, objectMapper, ownership,
-                mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5, 30);
+                mock(DualPoolRunAdmissionRegistry.class),
+                new DualPoolSchedulerSettings(null, new MockEnvironment()), 2, 120, 5, 30);
         task = new AsyncToolTask();
         task.setJobId(41L);
         task.setRunId("run-1");
@@ -80,7 +83,8 @@ class CanceledWaitMemberStopWorkerTest {
         task.setState("CANCELED");
         task.setClaimEpoch(1L);
         task.setRequestJson(proofJson("task-1"));
-        when(tasks.scanStopDue(any(), anyLong(), anyInt())).thenReturn(List.of(task));
+        when(tasks.scanStopDue(any(), any(), any(), any(), anyLong(), anyInt()))
+                .thenReturn(List.of(task));
         when(tasks.claimStop(eq(41L), any(), any(), any()))
                 .thenReturn(Optional.of(task), Optional.empty());
 

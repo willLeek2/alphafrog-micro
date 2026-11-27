@@ -10,6 +10,7 @@ import world.willfrog.agent.platform.asynctask.AsyncToolTaskStore;
 import world.willfrog.agent.platform.workitem.NodeWorkItemIdentity;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.SimpleTransactionStatus;
@@ -32,6 +33,7 @@ import world.willfrog.agent.tools.python.DataAnalysisCapacityProperties;
 import world.willfrog.agent.tools.python.DataAnalysisCapacityServiceImpl;
 import world.willfrog.agentlangchain.control.LangchainRunExecutionGuard;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.control.dualpool.SchedulerVersionPolicy;
 import world.willfrog.agentlangchain.control.scheduler.LangchainSchedulerMetrics;
 import world.willfrog.agentlangchain.execution.LangchainLinearRunPipeline;
@@ -615,7 +617,8 @@ class SqlWaitMemberCancellationLifecycleTest {
                     mock(ObjectProvider.class), mock(LangchainSchedulerMetrics.class)));
             worker = new CanceledWaitMemberStopWorker(tasks, groups,
                     sandbox, settlement, json, ownership,
-                    mock(DualPoolRunAdmissionRegistry.class), 2, 120, 5, 30);
+                    mock(DualPoolRunAdmissionRegistry.class),
+                    new DualPoolSchedulerSettings(null, new MockEnvironment()), 2, 120, 5, 30);
             ToolJobFinalizer finalizer = new ToolJobFinalizer(anchors, cache, capacity,
                     resume, config, mock(FinanceRecordChannelProcessor.class),
                     mock(FinanceRecordChannelConfigLoader.class), mock(FinanceToolResultFormatter.class),
@@ -894,9 +897,9 @@ class SqlWaitMemberCancellationLifecycleTest {
             when(tasks.findByJobId(anyLong())).thenAnswer(i ->
                     stop != null && stop.getWaitMemberId() == (long) i.getArgument(0)
                             ? Optional.of(asyncStopTask()) : Optional.empty());
-            when(tasks.scanStopDue(any(), anyLong(), anyInt())).thenAnswer(i -> {
-                OffsetDateTime now = i.getArgument(0);
-                long afterJobId = i.getArgument(1);
+            when(tasks.scanStopDue(any(), any(), any(), any(), anyLong(), anyInt())).thenAnswer(i -> {
+                OffsetDateTime now = i.getArgument(3);
+                long afterJobId = i.getArgument(4);
                 return stopDue(now) && stop.getWaitMemberId() > afterJobId
                         ? List.of(asyncStopTask()) : List.of();
             });

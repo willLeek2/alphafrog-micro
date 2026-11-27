@@ -39,6 +39,17 @@ class AsyncToolTaskStopSqlContractTest {
     }
 
     @Test
+    void stopScanOnlyTakesTasksOfThisDeploymentGenerationAndLane() {
+        assertThat(SCAN_STOP).as("停机扫描必须带部署标识、部署代际与泳道条件："
+                        + "缺少任何一项，别的实例都会把待停任务领走，重试用尽后把停止状态写成已确认，"
+                        + "真正归属的实例再也停不掉那个沙箱作业")
+                .contains("r.deployment_id = #{deploymentId}")
+                .contains("r.deployment_generation_id = #{deploymentGenerationId}")
+                .contains("r.lane_tag IS NULL")
+                .contains("r.lane_tag = #{laneTag}");
+    }
+
+    @Test
     void stopConfirmationWritesTheSandboxTaskId() {
         assertThat(FINISH_STOP).as("取消之后 attach 语句不再命中，收尾必须把任务编号写回任务行")
                 .contains("task_id = COALESCE(NULLIF(#{taskId}::varchar, ''), task_id)");

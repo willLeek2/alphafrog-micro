@@ -200,6 +200,26 @@
           AND (next_poll_at IS NULL OR next_poll_at &lt;= #{now})
           AND (lease_expires_at IS NULL OR lease_expires_at &lt;= #{now})
           AND job_id &gt; #{afterJobId}
+          -- 只取本部署代际、本泳道的待停任务。这里必须与旧停机表扫描
+          -- （WaitMemberStopMapper.claimDue）一样带部署标识与部署代际：蓝绿另一组实例
+          -- 领走后归属检查返回空，重试用尽会把 stop_state 写成已确认，真正归属的实例
+          -- 再也停不掉那个沙箱作业。部署代际在第二步切换归属判据时随 findOwnedRun
+          -- 一起去掉，不能提前单独去掉。泳道按现有约定匹配：进程泳道为空时只取空值。
+          AND EXISTS (
+              SELECT 1 FROM alphafrog_agent_run r
+               WHERE r.id = alphafrog_agent_async_tool_task.run_id
+                 AND r.deployment_id = #{deploymentId}
+                 AND r.deployment_generation_id = #{deploymentGenerationId}
+                 AND
+                 <choose>
+                     <when test="laneTag == null">
+                         r.lane_tag IS NULL
+                     </when>
+                     <otherwise>
+                         r.lane_tag = #{laneTag}
+                     </otherwise>
+                 </choose>
+          )
         ORDER BY job_id
         LIMIT #{limit}
     </select>

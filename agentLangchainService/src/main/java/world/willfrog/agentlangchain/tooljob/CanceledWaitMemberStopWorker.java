@@ -15,8 +15,10 @@ import world.willfrog.agent.platform.wait.WaitMember;
 import world.willfrog.agent.platform.wait.WaitMemberDispatchProof;
 import world.willfrog.agent.platform.wait.WaitMemberState;
 import world.willfrog.agentlangchain.control.dualpool.DualPoolRunAdmissionRegistry;
+import world.willfrog.agentlangchain.control.dualpool.DualPoolSchedulerSettings;
 import world.willfrog.agentlangchain.gateway.LaneScopeGateway;
 import world.willfrog.agentlangchain.gateway.RunOwnershipGateway;
+import world.willfrog.alphafrogmicro.common.deployment.DeploymentIdentity;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelOutcome;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskRequest;
 import world.willfrog.alphafrogmicro.sandbox.idl.CancelTaskResponse;
@@ -53,6 +55,8 @@ public class CanceledWaitMemberStopWorker {
     private final RunOwnershipGateway ownership;
     /** 只用于事件里的根运行编号：已受理的 Run 内存里带着根树身份。 */
     private final DualPoolRunAdmissionRegistry admissionRegistry;
+    /** 当前进程的泳道标签：停机扫描只取本泳道的待停任务。 */
+    private final DualPoolSchedulerSettings settings;
     private final WaitGroupStore groups;
     private final PythonSandboxService sandbox;
     private final WaitMemberSettlement settlement;
@@ -69,17 +73,19 @@ public class CanceledWaitMemberStopWorker {
                                         ObjectMapper objectMapper,
                                         RunOwnershipGateway ownership,
                                         DualPoolRunAdmissionRegistry admissionRegistry,
+                                        DualPoolSchedulerSettings settings,
                                         @Value("${agent.langchain.wait-member.stop.batch-size:16}") int batchSize,
                                         @Value("${agent.langchain.wait-member.stop.lease-seconds:120}") long leaseSeconds,
                                         @Value("${agent.langchain.wait-member.stop.retry-seconds:5}") long retrySeconds,
                                         @Value("${agent.langchain.wait-member.stop.max-attempts:30}") int maxAttempts) {
-        if (batchSize < 1 || batchSize > 1000 || leaseSeconds < 1 || retrySeconds < 1
-                || maxAttempts < 1) {
+        if (settings == null || batchSize < 1 || batchSize > 1000 || leaseSeconds < 1
+                || retrySeconds < 1 || maxAttempts < 1) {
             throw new IllegalArgumentException("停机 worker 参数无效");
         }
         this.tasks = tasks;
         this.ownership = ownership;
         this.admissionRegistry = admissionRegistry;
+        this.settings = settings;
         this.groups = groups;
         this.sandbox = sandbox;
         this.settlement = settlement;
@@ -100,12 +106,16 @@ public class CanceledWaitMemberStopWorker {
     }
 
     public int runBatch() {
-        ownership.requireIdentity();
+        DeploymentIdentity identity = ownership.requireIdentity();
         int processed = 0;
         long afterJobId = 0;
         while (processed < batchSize) {
             // 每轮扫描用自己的时刻：批内处理可能耗时，不能拿批开始时的时刻判断「到期」。
-            List<AsyncToolTask> due = tasks.scanStopDue(OffsetDateTime.now(), afterJobId, batchSize);
+            // 扫描范围与旧停机表扫描对齐：本部署、本代际、本泳道。少任何一项，
+            // 别的实例都会把行领走并在重试用尽后把停止状态写成已确认。
+            List<AsyncToolTask> due = tasks.scanStopDue(
+                    identity.deploymentId(), identity.generationId(), settings.processLaneTag(),
+                    OffsetDateTime.now(), afterJobId, batchSize);
             if (due.isEmpty()) {
                 break;
             }
