@@ -402,8 +402,11 @@ class Stage3WaitContractPostgresTest {
                     + "WHERE root_run_id = '" + runId + "'")).isEqualTo(1);
             transaction.executeWithoutResult(ignored ->
                     assertThat(store.markPhysicalStopped(delivery.childRunId())).isTrue());
-            assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
-                    + "WHERE root_run_id = '" + runId + "'")).isZero();
+            // 物理停机记录成功后，产品把计数减到 0 并删掉这一行；行不存在等价于占用为 0，
+            // 用标量子查询加 COALESCE 取值（与本文件前面的姊妹用例同一个写法）。
+            assertThat(countRows("SELECT COALESCE((SELECT active_child_count "
+                    + "FROM alphafrog_agent_run_tree_capacity "
+                    + "WHERE root_run_id = '" + runId + "'), 0)")).isZero();
             assertThat(store.hasUnsettledDescendants(runId)).isFalse();
             assertThat(store.listUnsettledByParent(runId, 0, 1000)).isEmpty();
             assertThat(store.listUnsettledByRoot(runId, 0, 1000)).isEmpty();
@@ -829,12 +832,13 @@ class Stage3WaitContractPostgresTest {
         // 是「op-call-a」，完成上报要带上同一个值，产品的完成语句按它逐字核对。
         assertThat(completeMember(fixture.groupId(), "call-a", WaitMemberState.SUCCEEDED,
                 fixture.runControlVersion(), "op-call-a").applied()).isTrue();
+        // 完成上报会把这一行的下次查询时间清空（已终态的成员不再轮询），所以「不变」要和
+        // 完成之后的值比较，不能再和压住时写入的时刻比较。
+        OffsetDateTime finishedPollAt = memberByIdentity(fixture.groupId(), "call-a").getNextPollAt();
         assertThat(holdMember(fixture.groupId(), "call-a", heldUntil.plusSeconds(60)))
                 .as("落终态之后压住写不进去").isFalse();
-        assertThat(memberByIdentity(fixture.groupId(), "call-a").getNextPollAt()
-                .truncatedTo(ChronoUnit.MICROS).toInstant())
-                .as("没写进去就不能改已经落定的那一行")
-                .isEqualTo(heldUntil.truncatedTo(ChronoUnit.MICROS).toInstant());
+        assertThat(memberByIdentity(fixture.groupId(), "call-a").getNextPollAt())
+                .as("没写进去就不能改已经落定的那一行").isEqualTo(finishedPollAt);
     }
 
     @Test
