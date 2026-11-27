@@ -299,8 +299,11 @@ class Stage3WaitContractPostgresTest {
                 assertThat(store.markAccepted(delivery.outboxId(), delivery.claimToken())).isFalse();
                 assertThat(store.cancelUnacceptedIfParentChanged(delivery.intentId())).isTrue();
             });
-            assertThat(countRows("SELECT active_child_count FROM alphafrog_agent_run_tree_capacity "
-                    + "WHERE root_run_id = '" + runId + "'")).isZero();
+            // 取消未受理子运行会先归还容量、再把空的容量行删掉；行不存在等价于占用为 0，
+            // 用标量子查询加 COALESCE 取值，断言的仍是「根树不再占容量」。
+            assertThat(countRows("SELECT COALESCE((SELECT active_child_count "
+                    + "FROM alphafrog_agent_run_tree_capacity "
+                    + "WHERE root_run_id = '" + runId + "'), 0)")).isZero();
             assertThat(countRows("SELECT count(*) FROM alphafrog_agent_run_child_outbox "
                     + "WHERE id = " + delivery.outboxId() + " AND state = 'CANCELED'")).isEqualTo(1);
             assertThat(store.hasUnsettledDescendants(runId)).isFalse();
@@ -365,7 +368,9 @@ class Stage3WaitContractPostgresTest {
                 child.setPlanJson("{}");
                 child.setSnapshotJson("{}");
                 child.setTtlExpiresAt(OffsetDateTime.now().plusHours(1));
-                child.setExt("{}");
+                // 产品创建子运行时会写 ext.child_run=true；rootRunIdOf 靠这个标记决定
+                // 是否去子运行意图表查根运行，夹具少了它就会把子运行自己的编号当成根。
+                child.setExt("{\"child_run\": true}");
                 child.setToolJobAnchorJson("{}");
                 child.setSchedulerVersion(SchedulerVersion.DUAL_POOL_V2.name());
                 child.setPlanGeneration(-1);
@@ -796,12 +801,13 @@ class Stage3WaitContractPostgresTest {
         // 不是「这一列一定是空」——先记下基线，再比压住后的值。
         OffsetDateTime siblingPollBefore = memberByIdentity(fixture.groupId(), "call-b").getNextPollAt();
 
-        OffsetDateTime heldUntil = OffsetDateTime.now().plusSeconds(5);
+        // PostgreSQL 的 timestamptz 只存到微秒，驱动对多出来的纳秒做四舍五入；
+        // 先把要写入的时刻截到微秒，库里的值才能和断言里的期望值逐微秒相等。
+        OffsetDateTime heldUntil = OffsetDateTime.now().plusSeconds(5).truncatedTo(ChronoUnit.MICROS);
         assertThat(holdMember(fixture.groupId(), "call-a", heldUntil)).as("压住要写进去").isTrue();
 
         WaitMember after = memberByIdentity(fixture.groupId(), "call-a");
-        // PostgreSQL 的 timestamptz 只存到微秒，Java 传进去的纳秒会被驱动截掉；
-        // 两边都截到微秒再比，断言的仍是「按压住给的那一刻走」，不是碰巧的纳秒尾巴。
+        // 写入前已经截到微秒，这里再统一截一次，断言的仍是「按压住给的那一刻走」。
         assertThat(after.getNextPollAt().truncatedTo(ChronoUnit.MICROS).toInstant())
                 .as("下次查询时间按压住给的那一刻走")
                 .isEqualTo(heldUntil.truncatedTo(ChronoUnit.MICROS).toInstant());
