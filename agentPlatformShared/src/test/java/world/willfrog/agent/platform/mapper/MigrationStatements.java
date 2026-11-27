@@ -11,9 +11,13 @@ import java.util.stream.Stream;
 /**
  * 把一份迁移脚本切成一条条可执行语句。
  *
- * <p>给真库用例用：脚本是给迁移管理器整份执行的，单条执行要先切句。切句规则只看三件事——
- * 单引号里的分号不算分界、{@code --} 注释整行丢掉、空语句丢掉。脚本里没有函数体与美元引用，
- * 所以不需要更复杂的规则；真出现那种写法时应当改用迁移管理器，而不是在这里补解析器。</p>
+ * <p>给真库用例用：脚本是给迁移管理器整份执行的，单条执行要先切句。切句规则看四件事——
+ * 单引号里的分号不算分界、{@code --} 注释整行丢掉、美元引用（{@code $$} 与 {@code $tag$}）
+ * 里的分号不算分界、空语句丢掉。</p>
+ *
+ * <p>美元引用这一条是补上的：升级链里 {@code v0.5/001_tushare_interfaces.sql} 有函数体与
+ * {@code DO $$} 块，早先只认单引号，会在 {@code NEW.updated_at = CURRENT_TIMESTAMP;} 的分号
+ * 处截断，真库上表现为「美元引用没有收尾」。</p>
  *
  * <p>脚本文件按文件名在整个仓库里找，找不到就报错：真库用例读不到脚本时应该失败，不该假装通过。</p>
  */
@@ -93,15 +97,40 @@ public final class MigrationStatements {
         List<String> statements = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         boolean inQuote = false;
+        String dollarTag = null;
         int index = 0;
         while (index < script.length()) {
             char ch = script.charAt(index);
+            if (dollarTag != null) {
+                // 美元引用里的一切原样保留：分号、引号、注释符都不算语法。
+                if (ch == '$') {
+                    String closing = dollarTagAt(script, index);
+                    if (dollarTag.equals(closing)) {
+                        current.append(closing);
+                        index += closing.length();
+                        dollarTag = null;
+                        continue;
+                    }
+                }
+                current.append(ch);
+                index++;
+                continue;
+            }
             if (!inQuote && ch == '-' && index + 1 < script.length() && script.charAt(index + 1) == '-') {
                 while (index < script.length() && script.charAt(index) != '\n') {
                     index++;
                 }
                 current.append('\n');
                 continue;
+            }
+            if (!inQuote && ch == '$') {
+                String opening = dollarTagAt(script, index);
+                if (opening != null) {
+                    dollarTag = opening;
+                    current.append(opening);
+                    index += opening.length();
+                    continue;
+                }
             }
             if (ch == '\'') {
                 // 两个连着单引号是转义写法，里面的引号不算收尾。
@@ -127,8 +156,39 @@ public final class MigrationStatements {
         if (inQuote) {
             throw new IllegalStateException("脚本里的单引号没有收尾，无法切句");
         }
+        if (dollarTag != null) {
+            throw new IllegalStateException("脚本里的美元引用没有收尾：" + dollarTag);
+        }
         addIfUseful(statements, current);
         return statements;
+    }
+
+    /**
+     * 识别从 {@code index} 处开始的美元引用开头（{@code $$} 或 {@code $tag$}）。
+     * 认不出就返回 {@code null}，例如 {@code $1} 这种位置参数。
+     */
+    private static String dollarTagAt(String script, int index) {
+        if (script.charAt(index) != '$') {
+            return null;
+        }
+        int end = script.indexOf('$', index + 1);
+        if (end < 0) {
+            return null;
+        }
+        String tag = script.substring(index + 1, end);
+        if (!tag.isEmpty()) {
+            char first = tag.charAt(0);
+            if (!Character.isLetter(first) && first != '_') {
+                return null;
+            }
+            for (int i = 0; i < tag.length(); i++) {
+                char ch = tag.charAt(i);
+                if (!Character.isLetterOrDigit(ch) && ch != '_') {
+                    return null;
+                }
+            }
+        }
+        return script.substring(index, end + 1);
     }
 
     private static void addIfUseful(List<String> statements, StringBuilder current) {

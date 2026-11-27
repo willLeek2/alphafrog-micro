@@ -68,6 +68,56 @@ class MigrationStatementsTest {
     }
 
     @Test
+    void semicolonsInsideDollarQuotesDoNotSplitStatements() {
+        String function = "CREATE OR REPLACE FUNCTION f() RETURNS TRIGGER AS $$\n"
+                + "BEGIN\n"
+                + "  NEW.updated_at = CURRENT_TIMESTAMP;\n"
+                + "  RETURN NEW;\n"
+                + "END;\n"
+                + "$$ language 'plpgsql';\n";
+        assertThat(MigrationStatements.split(function + "SELECT 1;"))
+                .as("函数体里的分号不算分界，整段函数一条语句")
+                .hasSize(2)
+                .first().asString().contains("END;\n$$ language 'plpgsql'");
+        assertThat(MigrationStatements.split("SELECT 1;")).containsExactly("SELECT 1");
+    }
+
+    @Test
+    void taggedDollarQuotesKeepTheirOwnDelimiter() {
+        String script = "DO $tag$\nBEGIN\n  PERFORM 1;\nEND $tag$;\nSELECT 2;";
+        List<String> statements = MigrationStatements.split(script);
+        assertThat(statements).hasSize(2);
+        assertThat(statements.get(0)).as("带标签的美元引用按自己的标签收尾")
+                .contains("END $tag$");
+        assertThat(statements.get(1)).isEqualTo("SELECT 2");
+    }
+
+    @Test
+    void dollarQuoteInsideSingleQuotesIsJustText() {
+        assertThat(MigrationStatements.split("SELECT '$$;' AS text;"))
+                .as("单引号里的 $$ 不开启美元引用")
+                .containsExactly("SELECT '$$;' AS text");
+    }
+
+    @Test
+    void unterminatedDollarQuoteFailsClosed() {
+        assertThatThrownBy(() -> MigrationStatements.split("DO $$ BEGIN PERFORM 1;"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("美元引用");
+    }
+
+    @Test
+    void realV05ScriptWithFunctionBodiesSplitsWithoutDanglingDollarQuotes() {
+        List<String> statements = MigrationStatements.split(
+                MigrationStatements.read("001_tushare_interfaces.sql"));
+        assertThat(statements).as("v0.5 那份脚本要能切开").isNotEmpty();
+        assertThat(statements).allSatisfy(statement ->
+                assertThat(statement.chars().filter(ch -> ch == '$').count() % 2)
+                        .as("每条语句里的美元符号必须成对：%s", statement)
+                        .isZero());
+    }
+
+    @Test
     void unterminatedQuoteFailsClosed() {
         assertThatThrownBy(() -> MigrationStatements.split("SELECT 'oops; SELECT 1;"))
                 .isInstanceOf(IllegalStateException.class)
